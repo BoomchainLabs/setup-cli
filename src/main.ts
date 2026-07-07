@@ -252,6 +252,7 @@ async function getPackageMetadata(resolution: PackageResolution): Promise<Packag
     "scripts",
     "dist.integrity",
     "--json",
+    "--offline=false",
   ]);
   const metadata = JSON.parse(output) as unknown;
 
@@ -293,6 +294,7 @@ function createInstallRoot(): string {
 async function runNpm(args: string[]): Promise<string> {
   const executable = process.env[NPM_EXECUTABLE_ENV]?.trim() || "npm";
   const proc = Bun.spawn([executable, ...args], {
+    cwd: process.env.GITHUB_WORKSPACE?.trim() ?? process.cwd(),
     env: process.env,
     stderr: "pipe",
     stdout: "pipe",
@@ -311,11 +313,11 @@ async function runNpm(args: string[]): Promise<string> {
 }
 
 export async function installCli(resolution: PackageResolution): Promise<string> {
+  const installRoot = createInstallRoot();
+
   const metadata = await getPackageMetadata(resolution);
   verifyPackageMetadata(resolution, metadata);
   verifyPackageIntegrity(resolution, metadata);
-
-  const installRoot = createInstallRoot();
 
   await runNpm([
     "install",
@@ -326,6 +328,8 @@ export async function installCli(resolution: PackageResolution): Promise<string>
     "--no-audit",
     "--no-fund",
     "--no-package-lock",
+    "--offline=false",
+    "--bin-links=true",
     `--ignore-scripts=${shouldIgnoreInstallScripts(metadata)}`,
     resolution.spec,
   ]);

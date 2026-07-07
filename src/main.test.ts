@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -7,6 +7,7 @@ import * as core from "@actions/core";
 
 const CLI_CONFIG_REGISTRY = "SUPABASE_INTERNAL_IMAGE_REGISTRY";
 const originalPath = process.env.PATH;
+const originalNpmUserconfig = process.env.NPM_CONFIG_USERCONFIG;
 const originalRunnerTemp = process.env.RUNNER_TEMP;
 const originalWorkspace = process.env.GITHUB_WORKSPACE;
 const tempDirs = new Set<string>();
@@ -15,14 +16,23 @@ let mainModule: typeof import("./main.ts") | null = null;
 afterEach(() => {
   mock.restore();
   process.env.PATH = originalPath;
+  if (originalNpmUserconfig === undefined) {
+    delete process.env.NPM_CONFIG_USERCONFIG;
+  } else {
+    process.env.NPM_CONFIG_USERCONFIG = originalNpmUserconfig;
+  }
   process.env.RUNNER_TEMP = originalRunnerTemp;
   process.env.GITHUB_WORKSPACE = originalWorkspace;
   delete process.env.FAKE_CLI_VERSION;
   delete process.env.FAKE_NPM_BIN;
   delete process.env.FAKE_NPM_INTEGRITY;
+  delete process.env.FAKE_NPM_CWD_LOG;
+  delete process.env.FAKE_NPM_ENV_LOG;
   delete process.env.FAKE_NPM_LOG;
   delete process.env.FAKE_NPM_PACKAGE_VERSION;
+  delete process.env.FAKE_NPM_PREFIX_CONFIG_LOG;
   delete process.env.FAKE_NPM_SCRIPTS;
+  delete process.env.SETUP_CLI_TEST_WORKSPACE;
   delete process.env.SUPABASE_SETUP_CLI_NPM;
 
   for (const dir of tempDirs) {
@@ -147,13 +157,27 @@ function createFakeNpm(): string {
   mkdirSync(binDir, { recursive: true });
   writeFileSync(
     scriptPath,
-    `import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
+    `import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 const args = process.argv.slice(2);
 appendFileSync(process.env.FAKE_NPM_LOG, JSON.stringify(args) + "\\n");
+appendFileSync(process.env.FAKE_NPM_CWD_LOG, process.cwd() + "\\n");
+appendFileSync(
+  process.env.FAKE_NPM_ENV_LOG,
+  JSON.stringify({ NPM_CONFIG_USERCONFIG: process.env.NPM_CONFIG_USERCONFIG ?? null }) + "\\n",
+);
+
+function recordConfig(configPath) {
+  appendFileSync(
+    process.env.FAKE_NPM_PREFIX_CONFIG_LOG,
+    JSON.stringify(existsSync(configPath) ? readFileSync(configPath, "utf8") : null) + "\\n",
+  );
+}
 
 if (args[0] === "view") {
+  recordConfig(path.join(process.cwd(), ".npmrc"));
+
   const bin =
     process.env.FAKE_NPM_BIN === "missing"
       ? undefined
@@ -185,6 +209,7 @@ if (!prefix) {
 
 const binDir = path.join(prefix, "node_modules", ".bin");
 mkdirSync(binDir, { recursive: true });
+recordConfig(path.join(prefix, ".npmrc"));
 
 if (process.platform === "win32") {
   writeFileSync(
@@ -229,10 +254,21 @@ function installFakeNpm(
   } = {},
 ): string {
   const binDir = createFakeNpm();
+  const cwdLogPath = path.join(createTempDir("setup-cli-fake-npm-cwd-log-"), "npm-cwd.log");
+  const envLogPath = path.join(createTempDir("setup-cli-fake-npm-env-log-"), "npm-env.log");
   const logPath = path.join(createTempDir("setup-cli-fake-npm-log-"), "npm.log");
+  const prefixConfigLogPath = path.join(
+    createTempDir("setup-cli-fake-npm-prefix-config-log-"),
+    "npm-prefix-config.log",
+  );
+  writeFileSync(cwdLogPath, "");
+  writeFileSync(envLogPath, "");
   writeFileSync(logPath, "");
+  writeFileSync(prefixConfigLogPath, "");
   process.env.FAKE_CLI_VERSION = versionOutput;
   process.env.FAKE_NPM_BIN = options.bin ?? "dist/supabase.js";
+  process.env.FAKE_NPM_CWD_LOG = cwdLogPath;
+  process.env.FAKE_NPM_ENV_LOG = envLogPath;
   process.env.FAKE_NPM_INTEGRITY = options.integrity ?? "sha512-test";
   process.env.FAKE_NPM_LOG = logPath;
   process.env.FAKE_NPM_PACKAGE_VERSION =
@@ -248,6 +284,7 @@ function installFakeNpm(
     binDir,
     process.platform === "win32" ? "npm.cmd" : "npm",
   );
+  process.env.FAKE_NPM_PREFIX_CONFIG_LOG = prefixConfigLogPath;
 
   return logPath;
 }
@@ -260,8 +297,31 @@ function readNpmCalls(logPath: string): string[][] {
     .map((line) => JSON.parse(line) as string[]);
 }
 
+function readNpmCwds(): string[] {
+  return readFileSync(process.env.FAKE_NPM_CWD_LOG ?? "", "utf8")
+    .trim()
+    .split("\n")
+    .filter(Boolean);
+}
+
+function readNpmEnvs(): Array<{ NPM_CONFIG_USERCONFIG: string | null }> {
+  return readFileSync(process.env.FAKE_NPM_ENV_LOG ?? "", "utf8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as { NPM_CONFIG_USERCONFIG: string | null });
+}
+
+function readNpmPrefixConfigs(): Array<string | null> {
+  return readFileSync(process.env.FAKE_NPM_PREFIX_CONFIG_LOG ?? "", "utf8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as string | null);
+}
+
 function viewMetadataCall(spec: string): string[] {
-  return ["view", spec, "version", "bin", "scripts", "dist.integrity", "--json"];
+  return ["view", spec, "version", "bin", "scripts", "dist.integrity", "--json", "--offline=false"];
 }
 
 function createActionSpies(inputVersion: string) {
@@ -442,6 +502,83 @@ test("installs the CLI with npm into an isolated prefix", async () => {
       "--no-audit",
       "--no-fund",
       "--no-package-lock",
+      "--offline=false",
+      "--bin-links=true",
+      "--ignore-scripts=true",
+      "supabase@2.101.0",
+    ],
+  ]);
+});
+
+test("runs npm with caller workspace config and action-owned overrides", async () => {
+  const workspace = createWorkspace({
+    ".npmrc": [
+      "registry=https://registry.example.test",
+      "@internal:registry=https://registry.internal.example.test",
+      "//registry.example.test/:_authToken=${NPM_TOKEN}",
+      "//registry.example.test/:certfile=certs/client.pem",
+      "//registry.example.test/:keyfile=certs/client-key.pem",
+      "always-auth",
+      'cafile="certs/project-ca.pem"',
+      'userconfig="${SETUP_CLI_TEST_WORKSPACE}/.npmrc-ci"',
+      "globalconfig=.npmrc-global",
+      "bin-links=false",
+      "offline=true",
+      "package-lock=true",
+    ].join("\n"),
+    ".npmrc-ci": [
+      "registry=https://delegated-registry.example.test",
+      "//registry.example.test/:_password=delegated",
+      "cafile=certs/delegated-ca.pem",
+      "bin-links=false",
+      "offline=true",
+    ].join("\n"),
+    ".npmrc-global": [
+      "registry=https://global-registry.example.test",
+      "//registry.example.test/:username=global",
+    ].join("\n"),
+    "certs/client-key.pem": "client-key",
+    "certs/client.pem": "client",
+    "certs/delegated-ca.pem": "delegated-ca",
+    "certs/project-ca.pem": "project-ca",
+  });
+  process.env.SETUP_CLI_TEST_WORKSPACE = workspace;
+  const userconfigPath = path.join(createTempDir("setup-cli-userconfig-"), ".npmrc");
+  writeFileSync(userconfigPath, "//registry.example.test/:username=existing\n");
+  process.env.NPM_CONFIG_USERCONFIG = userconfigPath;
+  process.env.GITHUB_WORKSPACE = workspace;
+  const logPath = installFakeNpm();
+  const { installCli } = await getMainModule();
+
+  await installCli({
+    spec: "supabase@2.101.0",
+    version: "2.101.0",
+  });
+
+  const realWorkspace = realpathSync(workspace);
+  const npmCwds = readNpmCwds().map((cwd) => realpathSync(cwd));
+  expect(npmCwds).toEqual([realWorkspace, realWorkspace]);
+  expect(readNpmEnvs().map((env) => env.NPM_CONFIG_USERCONFIG)).toEqual([
+    userconfigPath,
+    userconfigPath,
+  ]);
+  expect(readNpmPrefixConfigs()).toEqual([
+    readFileSync(path.join(workspace, ".npmrc"), "utf8"),
+    null,
+  ]);
+  expect(readNpmCalls(logPath)).toEqual([
+    viewMetadataCall("supabase@2.101.0"),
+    [
+      "install",
+      "--prefix",
+      expect.any(String),
+      "--omit=dev",
+      "--include=optional",
+      "--no-audit",
+      "--no-fund",
+      "--no-package-lock",
+      "--offline=false",
+      "--bin-links=true",
       "--ignore-scripts=true",
       "supabase@2.101.0",
     ],
@@ -471,6 +608,8 @@ test("allows install scripts for legacy npm packages that declare a preinstall",
       "--no-audit",
       "--no-fund",
       "--no-package-lock",
+      "--offline=false",
+      "--bin-links=true",
       "--ignore-scripts=false",
       "supabase@1.15.1",
     ],
@@ -500,6 +639,8 @@ test("allows install scripts for npm packages that declare a postinstall", async
       "--no-audit",
       "--no-fund",
       "--no-package-lock",
+      "--offline=false",
+      "--bin-links=true",
       "--ignore-scripts=false",
       "supabase@1.178.2",
     ],
@@ -527,6 +668,8 @@ test("verifies lockfile integrity before installing", async () => {
       "--no-audit",
       "--no-fund",
       "--no-package-lock",
+      "--offline=false",
+      "--bin-links=true",
       "--ignore-scripts=true",
       "supabase@2.101.0",
     ],
